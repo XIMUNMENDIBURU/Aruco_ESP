@@ -1,0 +1,52 @@
+#include "Access_point.h"
+
+String html_generator(int seuil) {
+  if (seuil < 0) seuil = 0;
+  if (seuil > 255) seuil = 255;
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>ESP32-CAM ArUco</title>";
+  html += "<style>";
+  html += "body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif;text-align:center}";
+  html += "h1{margin:16px 0 8px;font-size:1.4rem;color:#ffbb00}";
+  html += "img{width:90%;max-width:960px;border:4px solid #ffbb00;border-radius:16px;background:#000}";
+  html += ".panneau{margin:14px auto 24px;padding:14px 18px;max-width:480px;background:#1c1c1c;border-radius:12px}";
+  html += "label{display:block;margin-bottom:8px;color:#ffbb00}";
+  html += "input[type=range]{width:100%}";
+  html += ".valeur{font-size:1.6rem;margin:6px 0 2px}";
+  html += ".aide{font-size:.85rem;color:#aaa;margin:0}";
+  html += ".etat{font-size:.9rem;margin-top:8px;color:#8f8}";
+  html += "button{margin-top:10px;padding:8px 14px;border:0;border-radius:8px;background:#ffbb00;color:#111;font-weight:600;cursor:pointer}";
+  html += "</style></head><body>";
+  html += "<h1>ESP32-CAM ArUco</h1>";
+  html += "<img id='flux' alt='flux'>";
+  html += "<div class='panneau'>";
+  html += "<label for='seuil'>Seuil gris (noir si pixel &lt; seuil)</label>";
+  html += "<div class='valeur'><span id='val'>";
+  html += String(seuil);
+  html += "</span></div>";
+  html += "<input id='seuil' type='range' min='0' max='255' value='";
+  html += String(seuil);
+  html += "'>";
+  html += "<p class='aide'>Lineaire + ouverture 3x3. Plus haut = plus de noir. Defaut = 100. Flux :81.</p>";
+  html += "<button type='button' id='reset'>Remettre 100</button>";
+  html += "<p class='etat' id='etat'>pret</p>";
+  html += "</div>";
+  html += "<script>";
+  html += "const s=document.getElementById('seuil'),v=document.getElementById('val'),r=document.getElementById('reset'),e=document.getElementById('etat');";
+  html += "document.getElementById('flux').src='http://'+location.hostname+':81/stream';";
+  html += "let t=null;";
+  html += "async function envoyer(x){";
+  html += "v.textContent=x;e.textContent='envoi...';e.style.color='#ffbb00';";
+  html += "clearTimeout(t);";
+  html += "t=setTimeout(async()=>{";
+  html += "try{const r=await fetch('/seuil?v='+x+'&t='+Date.now(),{cache:'no-store'});";
+  html += "const txt=await r.text();";
+  html += "if(!r.ok)throw new Error(txt||r.status);";
+  html += "v.textContent=txt.trim();e.textContent='applique: '+txt.trim();e.style.color='#8f8';";
+  html += "}catch(err){e.textContent='echec: '+err;e.style.color='#f88';}";
+  html += "},60);}";
+  html += "s.oninput=()=>envoyer(s.value);";
+  html += "r.onclick=()=>{s.value=100;envoyer(100);};";
+  html += "</script></body></html>";
+  return html;
+}
