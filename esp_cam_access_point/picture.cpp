@@ -23,6 +23,11 @@
 #endif
 #define COTE_ARUCO_MM 70
 #define FOCALE_PX 280        // 320 px de large, champ horizontal d'environ 60°
+#define PISTE_MAX 4
+#define DET_MAX 8
+#define KALMAN_PERDU_MAX 8   // frames sans mesure avant perte de piste
+#define FULLSCAN_PERIOD 12   // full frame périodique même avec pistes
+#define ROI_MARGE 1.9f       // ROI = cote * marge (+ sigma)
 #define LEDblanche 4
 #define canalPWM 7
 
@@ -101,6 +106,172 @@ static int largeur_image = 320;
 static int echelle_image() {
   int echelle = largeur_image / 320;
   return echelle < 1 ? 1 : echelle;
+}
+
+// --- Filtre de Kalman 1D (position + vitesse), un axe ---
+struct Filtre1D {
+  float x, v;
+  float p00, p01, p10, p11;
+};
+
+struct Detection {
+  char type;
+  uint16_t id;
+  int orientation;
+  int c1x, c1y, c3x, c3y, c4x, c4y, c2x, c2y;
+  float cx, cy, cote;
+  bool associe;
+};
+
+struct Piste {
+  bool actif;
+  bool vu;
+  Filtre1D fx, fy;
+  float cote;
+  uint16_t id;
+  int orientation;
+  int perdu;
+  int age;
+};
+
+static Detection dets[DET_MAX];
+static int ndets = 0;
+static Piste pistes[PISTE_MAX];
+static int frames_depuis_full = 0;
+static int64_t t_prev_us = 0;
+
+// Contourne un ICE du GCC Xtensa (postreload) sur certains float ternaires / sqrtf.
+#if defined(ARDUINO_ARCH_ESP32)
+#define KALMAN_ATTR __attribute__((noinline, optimize("Os")))
+#else
+#define KALMAN_ATTR
+#endif
+
+static KALMAN_ATTR void filtre_init(Filtre1D* f, float x) {
+  f->x = x;
+  f->v = 0.f;
+  f->p00 = 25.f;
+  f->p01 = 0.f;
+  f->p10 = 0.f;
+  f->p11 = 100.f;
+}
+
+static KALMAN_ATTR void filtre_predire(Filtre1D* f, float dt, float q) {
+  f->x = f->x + f->v * dt;
+  float dt2 = dt * dt;
+  float a = f->p00;
+  float b = f->p01;
+  float c = f->p10;
+  float d = f->p11;
+  f->p00 = a + dt * (b + c) + dt2 * d + q;
+  f->p01 = b + dt * d;
+  f->p10 = c + dt * d;
+  f->p11 = d + q;
+}
+
+static KALMAN_ATTR void filtre_corriger(Filtre1D* f, float z, float r) {
+  float innov = z - f->x;
+  float S = f->p00 + r;
+  if (S < 0.001f) S = 0.001f;
+  float k0 = f->p00 / S;
+  float k1 = f->p10 / S;
+  f->x = f->x + k0 * innov;
+  f->v = f->v + k1 * innov;
+  float a = f->p00;
+  float b = f->p01;
+  float c = f->p10;
+  float d = f->p11;
+  f->p00 = (1.f - k0) * a;
+  f->p01 = (1.f - k0) * b;
+  f->p10 = c - k1 * a;
+  f->p11 = d - k1 * b;
+}
+
+static float longueur_segment(int ax, int ay, int bx, int by) {
+  float dx = (float)(bx - ax);
+  float dy = (float)(by - ay);
+  return sqrtf(dx * dx + dy * dy);
+}
+
+static float detection_cote(int c1x, int c1y, int c3x, int c3y, int c4x, int c4y, int c2x, int c2y) {
+  float cote = longueur_segment(c1x, c1y, c3x, c3y);
+  cote += longueur_segment(c3x, c3y, c4x, c4y);
+  cote += longueur_segment(c4x, c4y, c2x, c2y);
+  cote += longueur_segment(c2x, c2y, c1x, c1y);
+  return cote * 0.25f;
+}
+
+static int piste_libre() {
+  for (int i = 0; i < PISTE_MAX; i++) {
+    if (!pistes[i].actif) return i;
+  }
+  return -1;
+}
+
+static void piste_creer(const Detection* d) {
+  int i = piste_libre();
+  if (i < 0) return;
+  Piste* p = &pistes[i];
+  p->actif = true;
+  p->vu = true;
+  filtre_init(&p->fx, d->cx);
+  filtre_init(&p->fy, d->cy);
+  p->cote = d->cote;
+  p->id = d->id;
+  p->orientation = d->orientation;
+  p->perdu = 0;
+  p->age = 1;
+  Serial.printf("Piste+%d id=%u cx=%d cy=%d s=%d\n", i, (unsigned)d->id, (int)d->cx, (int)d->cy, (int)d->cote);
+}
+
+static KALMAN_ATTR void piste_roi(const Piste* p, int w, int h, int* x0, int* y0, int* x1, int* y1) {
+  // Marge sans sqrtf (évite ICE GCC ESP32) : approx. via variance elle-même.
+  float var = p->fx.p00 + p->fy.p00;
+  if (var < 0.f) var = 0.f;
+  float marge = ROI_MARGE * p->cote + 0.12f * var + 16.f;
+  if (marge < 28.f) marge = 28.f;
+  int cx = (int)(p->fx.x + 0.5f);
+  int cy = (int)(p->fy.x + 0.5f);
+  int m = (int)(marge + 0.5f);
+  int xa = cx - m;
+  int xb = cx + m;
+  int ya = cy - m;
+  int yb = cy + m;
+  if (xa < 0) xa = 0;
+  if (ya < 0) ya = 0;
+  if (xb >= w) xb = w - 1;
+  if (yb >= h) yb = h - 1;
+  *x0 = xa;
+  *y0 = ya;
+  *x1 = xb;
+  *y1 = yb;
+}
+
+static KALMAN_ATTR bool dans_gate(const Piste* p, const Detection* d) {
+  float dx = d->cx - p->fx.x;
+  float dy = d->cy - p->fy.x;
+  float dist2 = dx * dx + dy * dy;
+  float var = p->fx.p00 + p->fy.p00;
+  if (var < 1.f) var = 1.f;
+  float rayon = 0.85f * p->cote + 0.35f * var;
+  if (rayon < 30.f) rayon = 30.f;
+  return dist2 <= (rayon * rayon);
+}
+
+static void scanner_zone(camera_fb_t* fb, uint8_t* rgb_buf, int x0, int y0, int x1, int y1) {
+  int bande = 6 * echelle_image();
+  int y_start = -1;
+  for (int y = y0; y <= y1; y++) {
+    if (histY[y] > bande && y_start == -1) {
+      y_start = y;
+    } else if ((histY[y] <= bande || y == y1) && y_start != -1) {
+      int yE = y;
+      if (y_start < y0) y_start = y0;
+      if (yE > y1 + 1) yE = y1 + 1;
+      if (yE > y_start) process_y_band(fb, rgb_buf, (uint16_t)y_start, (uint16_t)yE, (uint16_t)x0, (uint16_t)(x1 + 1));
+      y_start = -1;
+    }
+  }
 }
 
 void draw_line(uint8_t* buf, int w, int x0, int y0, int x1, int y1) {
@@ -707,6 +878,24 @@ void process_and_draw_aruco(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t xSeed, u
   uint16_t y[4] = { c1y, c3y, c4y, c2y };
   if (type == 'P') bilan_pierres++;
   else bilan_inconnus++;
+  if (ndets < DET_MAX) {
+    Detection* d = &dets[ndets++];
+    d->type = type;
+    d->id = id;
+    d->orientation = orientation;
+    d->c1x = c1x;
+    d->c1y = c1y;
+    d->c3x = c3x;
+    d->c3y = c3y;
+    d->c4x = c4x;
+    d->c4y = c4y;
+    d->c2x = c2x;
+    d->c2y = c2y;
+    d->cx = (c1x + c3x + c4x + c2x) * 0.25f;
+    d->cy = (c1y + c3y + c4y + c2y) * 0.25f;
+    d->cote = detection_cote(c1x, c1y, c3x, c3y, c4x, c4y, c2x, c2y);
+    d->associe = false;
+  }
   send_aruco_frame(id, type, x, y);
   draw_line(rgb_buf, w, c1x, c1y, c3x, c3y);
   draw_line(rgb_buf, w, c3x, c3y, c4x, c4y);
@@ -788,12 +977,14 @@ static void effacer_fond_cadre(uint8_t* buf, int w, int h) {
   }
 }
 
-void process_y_band(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t yS, uint16_t yE) {
+void process_y_band(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t yS, uint16_t yE, uint16_t xS, uint16_t xE) {
   uint16_t w = fb->width;
   uint16_t h = fb->height;
+  if (xE > w) xE = w;
+  if (xS >= xE) return;
   for (uint16_t y = yS; y < yE; y++) {
     uint8_t* row = fb->buf + (y * w);
-    for (uint16_t x = 0; x < w; x++) {
+    for (uint16_t x = xS; x < xE; x++) {
       if (row[x] != 0) continue;
       int voisins = 0;
       bool bord = false;
@@ -817,27 +1008,101 @@ void process_y_band(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t yS, uint16_t yE)
 void analyser_frame(camera_fb_t* fb, uint8_t* rgb_buf, int* pierres, int* inconnus, int* noirs) {
   bilan_pierres = 0;
   bilan_inconnus = 0;
+  ndets = 0;
   largeur_image = (int)fb->width;
-  if (fb->width < 1 || fb->height < 1 || fb->height > HIST_Y_MAX) {
+  int w = (int)fb->width;
+  int h = (int)fb->height;
+  if (w < 1 || h < 1 || h > HIST_Y_MAX) {
     if (pierres) *pierres = 0;
     if (inconnus) *inconnus = 0;
     if (noirs) *noirs = 0;
     return;
   }
+
+  int64_t t_now = esp_timer_get_time();
+  float dt = 0.05f;
+  if (t_prev_us > 0) {
+    float dus = (float)(t_now - t_prev_us);
+    dt = dus / 1000000.f;
+  }
+  if (dt < 0.005f) dt = 0.005f;
+  if (dt > 0.2f) dt = 0.2f;
+  t_prev_us = t_now;
+
+  float q = 8.f * dt;
+  float r_mesure = 9.f;
+  int pistes_actives = 0;
+  for (int i = 0; i < PISTE_MAX; i++) {
+    if (!pistes[i].actif) continue;
+    pistes_actives++;
+    pistes[i].vu = false;
+    filtre_predire(&pistes[i].fx, dt, q);
+    filtre_predire(&pistes[i].fy, dt, q);
+  }
+
+  bool full = (pistes_actives == 0) || (frames_depuis_full >= FULLSCAN_PERIOD);
+  frames_depuis_full = full ? 0 : (frames_depuis_full + 1);
+
   binarize_and_histY(fb, rgb_buf, histY);
-  int y_start = -1;
-  int hauteur = fb->height;
-  int bande = 6 * echelle_image();
-  for (int y = 0; y < hauteur; y++) {
-    if (histY[y] > bande && y_start == -1) {
-      y_start = y;
-    } else if ((histY[y] <= bande || y == hauteur - 1) && y_start != -1) {
-      process_y_band(fb, rgb_buf, (uint16_t)y_start, (uint16_t)y);
-      y_start = -1;
+
+  if (full) {
+    scanner_zone(fb, rgb_buf, 0, 0, w - 1, h - 1);
+  } else {
+    for (int i = 0; i < PISTE_MAX; i++) {
+      if (!pistes[i].actif) continue;
+      int x0, y0, x1, y1;
+      piste_roi(&pistes[i], w, h, &x0, &y0, &x1, &y1);
+      draw_debug_rect(rgb_buf, w, x0, y0, x1, y1);
+      scanner_zone(fb, rgb_buf, x0, y0, x1, y1);
     }
   }
+
+  for (int i = 0; i < ndets; i++) {
+    Detection* d = &dets[i];
+    if (d->type != 'P' || d->cote < 1.f) continue;
+    int meilleur = -1;
+    float meilleur_d2 = 1000000000.f;
+    for (int p = 0; p < PISTE_MAX; p++) {
+      if (!pistes[p].actif || pistes[p].vu) continue;
+      if (!dans_gate(&pistes[p], d)) continue;
+      float dx = d->cx - pistes[p].fx.x;
+      float dy = d->cy - pistes[p].fy.x;
+      float d2 = dx * dx + dy * dy;
+      if (d2 < meilleur_d2) {
+        meilleur_d2 = d2;
+        meilleur = p;
+      }
+    }
+    if (meilleur >= 0) {
+      Piste* p = &pistes[meilleur];
+      filtre_corriger(&p->fx, d->cx, r_mesure);
+      filtre_corriger(&p->fy, d->cy, r_mesure);
+      p->cote = 0.7f * p->cote + 0.3f * d->cote;
+      p->id = d->id;
+      p->orientation = d->orientation;
+      p->vu = true;
+      p->perdu = 0;
+      p->age++;
+      d->associe = true;
+    } else {
+      piste_creer(d);
+      d->associe = true;
+    }
+  }
+
+  for (int i = 0; i < PISTE_MAX; i++) {
+    if (!pistes[i].actif) continue;
+    if (pistes[i].vu) continue;
+    pistes[i].perdu++;
+    if (pistes[i].perdu >= KALMAN_PERDU_MAX) {
+      Serial.printf("Piste-%d perdue\n", i);
+      pistes[i].actif = false;
+      frames_depuis_full = FULLSCAN_PERIOD;
+    }
+  }
+
   int compte_noir = 0;
-  int pixels = fb->width * fb->height;
+  int pixels = w * h;
   for (int i = 0; i < pixels; i++) {
     if (fb->buf[i] == 0) compte_noir++;
   }

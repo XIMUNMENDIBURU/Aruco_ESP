@@ -33,7 +33,7 @@ void draw_line(uint8_t* buf, int w, int x0, int y0, int x1, int y1);
 void draw_debug_rect(uint8_t* buf, int w, int x1, int y1, int x2, int y2);
 void binarize_and_histY(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t* hY) ;
 void process_and_draw_aruco(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t xSeed, uint16_t ySeed);
-void process_y_band(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t yS, uint16_t yE) ;
+void process_y_band(camera_fb_t* fb, uint8_t* rgb_buf, uint16_t yS, uint16_t yE, uint16_t xS, uint16_t xE);
 void check_for_commands();
 void video_handler();
 static esp_err_t stream_handler(httpd_req_t* req);
